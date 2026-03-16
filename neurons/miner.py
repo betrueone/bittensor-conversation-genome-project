@@ -16,6 +16,7 @@
 # DEALINGS IN THE SOFTWARE.
 
 import time
+import traceback
 import typing
 
 # Bittensor
@@ -29,6 +30,10 @@ from conversationgenome.task import Task
 from conversationgenome.task.task_factory import parse_task
 from conversationgenome.utils.Utils import Utils
 
+import httpx
+import asyncio
+
+MAX_RETRIES = 30
 
 class Miner(BaseMinerNeuron):
     verbose = False
@@ -48,18 +53,80 @@ class Miner(BaseMinerNeuron):
             CgSynapse: The synapse object with the 'cgp_output' field
 
         """
-        ml = MinerLib()
 
+        bt.logging.info(f"Miner received synapse from {synapse.dendrite.hotkey}")
+        bt.logging.info(f"Miner received synapse from {synapse.cgp_input}")
+
+        # Ensure we always return a synapse object; returning None can crash downstream bittensor internals.
+        def _set_error_output(message: str) -> None:
+            synapse.cgp_output = [{"error": message}]
+
+        out_synapse = {"cgp_input": synapse.cgp_input, "cgp_output": synapse.cgp_output}
+        url = "http://localhost:8001/api/readyai/llm"
+
+        # Use an async client inside this async forward() to avoid blocking the event loop.
+        timeout = httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0)
         try:
-            task: Task = parse_task(synapse.cgp_input[0]["task"])
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                for attempt in range(MAX_RETRIES):
+                    try:
+                        result = await client.post(url, json=out_synapse)
+                    except (httpx.TimeoutException, httpx.RequestError) as e:
+                        # Treat transient network/timeout issues as retryable.
+                        bt.logging.warning(
+                            f"ReadyAI request failed on attempt {attempt + 1}/{MAX_RETRIES}: {type(e).__name__}: {e}"
+                        )
+                        await asyncio.sleep(2)
+                        continue
 
-            bt.logging.info(f"Miner received task of type {task.type}")
-            result = await ml.do_mining(task=task)
+                    # Non-2xx responses should still surface details if possible.
+                    try:
+                        response = result.json()
+                    except Exception:
+                        response = {"status": "error", "message": result.text, "http_status": result.status_code}
+
+                    if response.get("status") == "ready":
+                        llm_result = response.get("result", {})
+                        # Protocol expects List[dict]
+                        synapse.cgp_output = [llm_result] if isinstance(llm_result, dict) else [{"result": llm_result}]
+                        bt.logging.info("Miner received ReadyAI result (status=ready).")
+                        return synapse
+
+                    if response.get("status") == "computing":
+                        retry_after = response.get("retry_after", 2)
+                        try:
+                            retry_after = float(retry_after)
+                        except Exception:
+                            retry_after = 2.0
+                        await asyncio.sleep(max(0.5, retry_after))
+                        continue
+
+                    # Anything else is treated as a hard error and returned as output for the caller to handle.
+                    _set_error_output(f"ReadyAI error: {response}")
+                    bt.logging.error(f"ReadyAI returned unexpected response: {response}")
+                    return synapse
+
+                _set_error_output(f"ReadyAI did not become ready after {MAX_RETRIES} attempts.")
+                bt.logging.error(f"ReadyAI did not become ready after {MAX_RETRIES} attempts.")
+                return synapse
+
         except Exception as e:
-            bt.logging.error(f"Error extracting task from synapse")
+            bt.logging.error(traceback.format_exc())
+            _set_error_output(f"Unhandled miner error: {type(e).__name__}: {e}")
+            return synapse
+
+        # ml = MinerLib()
+
+        # try:
+        #     task: Task = parse_task(synapse.cgp_input[0]["task"])
+
+        #     bt.logging.info(f"Miner received task of type {task.type}")
+        #     result = await ml.do_mining(task=task)
+        # except Exception as e:
+        #     bt.logging.error(f"Error extracting task from synapse")
             
-        synapse.cgp_output = [result]
-        return synapse
+        # synapse.cgp_output = [result]
+        # return synapse
 
     async def blacklist(self, synapse: CgSynapse) -> typing.Tuple[bool, str]:
         """

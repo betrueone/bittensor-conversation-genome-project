@@ -56,6 +56,7 @@ class ApiLib:
 
         if response and response.status_code == 200:
             data = response.json()
+            print(f"📑📑📑 data: {data}")
             task_bundle: TaskBundle = try_parse_task_bundle(data)
 
             if not task_bundle:
